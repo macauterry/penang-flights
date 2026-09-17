@@ -1,6 +1,7 @@
 // 내 PC에서 앱을 켜는 파일입니다.  실행: node tools/serve.mjs
 // - 같은 와이파이의 휴대폰에서도 접속할 수 있게 주소를 알려줍니다.
-// - 켜져 있는 동안 매일 아침 7시(한국 시각) 이후 한 번 가격을 새로 알아봅니다.
+// - 가격 업데이트는 GitHub가 매일 하므로 여기서는 하지 않습니다.
+//   (GitHub 없이 PC로만 쓸 때는 .env 에 PENANG_LOCAL_UPDATE=true 를 넣으면 매일 7시 이후 업데이트)
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
@@ -9,6 +10,9 @@ import { dirname, extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+for (const p of [join(ROOT, '.env'), join(ROOT, '..', '.env')]) {
+  try { process.loadEnvFile(p); } catch { /* 없으면 무시 */ }
+}
 const PORT = Number(process.env.PENANG_PORT || 3100);
 const UPDATE_HOUR_KST = 7;
 
@@ -73,5 +77,7 @@ async function maybeUpdate() {
   const child = spawn(process.execPath, [join(ROOT, 'tools', 'update.mjs')], { stdio: 'inherit' });
   child.on('exit', () => { running = false; });
 }
-maybeUpdate();
-setInterval(maybeUpdate, 30 * 60_000);
+if (String(process.env.PENANG_LOCAL_UPDATE || '').toLowerCase() === 'true') {
+  maybeUpdate();
+  setInterval(maybeUpdate, 30 * 60_000);
+}
