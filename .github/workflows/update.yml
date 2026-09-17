@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: '0 22 * * *'
   workflow_dispatch:
+    inputs:
+      max:
+        description: '이번에 조회할 최대 횟수 (비우면 자동)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -28,11 +33,12 @@ jobs:
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           APP_URL: ${{ vars.APP_URL }}
-        run: node tools/update.mjs
+        run: node tools/update.mjs ${{ inputs.max && format('--max {0}', inputs.max) || '' }}
       - name: 결과 저장
         run: |
           git config user.name "price-bot"
           git config user.email "price-bot@users.noreply.github.com"
           git add data/prices.json
           git diff --cached --quiet || git commit -m "가격 업데이트 $(TZ=Asia/Seoul date +'%Y-%m-%d %H:%M')"
+          git pull --rebase --autostash
           git push
