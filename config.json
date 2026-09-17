@@ -1,0 +1,18 @@
+{
+  "routes": [
+    { "id": "ICN-PEN", "from": "ICN", "to": "PEN", "label": "인천 → 페낭" },
+    { "id": "PEN-ICN", "from": "PEN", "to": "ICN", "label": "페낭 → 인천" }
+  ],
+  "airlines": ["SQ", "MH", "KE"],
+  "maxStops": 1,
+  "layoverMinMinutes": 100,
+  "layoverMaxMinutes": 180,
+  "daysAheadMin": 3,
+  "daysAheadMax": 45,
+  "adults": 1,
+  "currency": "KRW",
+  "reserveSearches": 50,
+  "maxPerRun": 12,
+  "runsPerDay": 1,
+  "dropAlertPercent": 5
+}
