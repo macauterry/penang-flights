@@ -1,371 +1,685 @@
-// 인천⇄페낭 최저가 앱 화면. data/prices.json 을 읽어서 보여주기만 합니다 (조회 횟수를 쓰지 않음).
+// 인천⇄페낭 왕복 항공권 앱
+// 여행 기간(가는 날 ±며칠, 오는 날 ±며칠)을 넣으면 말레이시아항공·싱가포르항공·대한항공 왕복을 각각 조회하고,
+// 대한항공은 쿠알라룸푸르↔페낭 이동수단까지 계산하고, 고른 항공권의 실제 예약처로 바로 연결합니다.
 (() => {
   'use strict';
 
+  const DEFAULT_API = 'https://penang-flights.debonair-eustoma.workers.dev';
+  const LAYOVER = { min: 100, max: 180 };
   const AIRLINES = {
-    SQ: { ko: '싱가포르항공', en: 'Singapore Airlines', site: 'https://www.singaporeair.com/ko_KR/kr/home' },
-    MH: { ko: '말레이시아항공', en: 'Malaysia Airlines', site: 'https://www.malaysiaairlines.com/kr/ko.html' },
-    KE: { ko: '대한항공', en: 'Korean Air', site: 'https://www.koreanair.com/' },
+    MH: { ko: '말레이시아항공', en: 'Malaysia Airlines', dest: 'PEN', site: 'https://www.malaysiaairlines.com/kr/ko.html', hub: '쿠알라룸푸르' },
+    SQ: { ko: '싱가포르항공', en: 'Singapore Airlines', dest: 'PEN', site: 'https://www.singaporeair.com/ko_KR/kr/home', hub: '싱가포르' },
+    KE: { ko: '대한항공', en: 'Korean Air', dest: 'KUL', site: 'https://www.koreanair.com/', hub: '' },
   };
   const AIRPORTS = { ICN: '인천', PEN: '페낭', KUL: '쿠알라룸푸르', SIN: '싱가포르' };
-  const STAYS = [
-    { id: 's1', label: '3~7박', min: 3, max: 7 },
-    { id: 's2', label: '8~14박', min: 8, max: 14 },
-    { id: 's3', label: '15~30박', min: 15, max: 30 },
-    { id: 's4', label: '전체', min: 1, max: 60 },
-  ];
   const DOW = ['일', '월', '화', '수', '목', '금', '토'];
-  const DAY = 86_400_000;
-  const STALE_DAYS = 7;
+  const PRE_TRIP = 150; // 집 → 인천공항 30분 + 출발 2시간 전 도착
+  const POST_PEN = 60; // 페낭공항 도착 → 집 (짐 찾기 + 택시)
 
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-
   const store = {
-    get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
-    set(k, v) { try { localStorage.setItem(k, v); } catch { /* 저장 불가 환경 */ } },
+    get(k, d = null) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch { /* 저장 불가 */ } },
   };
 
-  let data = null;
-  let routeId = store.get('route', 'ICN-PEN');
-  let stayId = store.get('stay', 's1');
+  // PIN 은 주소 뒤 #pin=... 으로 한 번 넘겨받아 저장합니다.
+  (() => {
+    const m = /(?:^|[#&])pin=([^&]+)/.exec(location.hash);
+    if (m) {
+      store.set('pin', decodeURIComponent(m[1]));
+      history.replaceState(null, '', location.pathname + location.search);
+    }
+    const api = /(?:^|[?&])api=([^&]+)/.exec(location.search);
+    if (api) store.set('api', decodeURIComponent(api[1]));
+  })();
+  const API = () => store.get('api') || DEFAULT_API;
 
-  // ── 날짜·숫자 표시 ──────────────────────────────────────
-  const parse = (iso) => new Date(`${iso}T00:00:00Z`);
-  const addDays = (iso, n) => new Date(parse(iso).getTime() + n * DAY).toISOString().slice(0, 10);
-  const diffDays = (a, b) => Math.round((parse(b) - parse(a)) / DAY);
-  const md = (iso) => { const d = parse(iso); return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`; };
-  const dow = (iso) => DOW[parse(iso).getUTCDay()];
-  const mdw = (iso) => `${md(iso)}(${dow(iso)})`;
-  const won = (n) => `${Math.round(n).toLocaleString('ko-KR')}원`;
-  const man = (n) => (n / 10000).toFixed(n >= 1_000_000 ? 0 : 1);
+  let state = { trip: null, result: null, lastRecheck: null };
+  let quota = null;
+  let busy = false;
+  let groundTab = 'out';
+
+  // ── 표시 도우미 ───────────────────────────────────────
+  const parseD = (iso) => new Date(`${iso}T00:00:00Z`);
+  const addDays = (iso, n) => new Date(parseD(iso).getTime() + n * 86400000).toISOString().slice(0, 10);
+  const mdw = (iso) => { const d = parseD(iso); return `${d.getUTCMonth() + 1}/${d.getUTCDate()}(${DOW[d.getUTCDay()]})`; };
+  const md = (iso) => { const d = parseD(iso); return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`; };
+  const won = (n) => (n == null ? '가격 미공개' : `${Math.round(n).toLocaleString('ko-KR')}원`);
+  const man = (n) => (n / 10000).toFixed(1);
   const hm = (min) => `${Math.floor(min / 60)}시간${min % 60 ? ` ${min % 60}분` : ''}`;
   const hhmm = (t) => String(t).slice(11, 16);
-  const ageDays = (iso) => (Date.now() - Date.parse(iso)) / DAY;
-  function ageText(iso) {
-    const d = ageDays(iso);
-    if (d < 1) return '오늘 확인';
-    return `${Math.floor(d)}일 전 확인`;
-  }
-  function stamp(iso) {
-    const d = new Date(iso);
-    const k = new Date(d.getTime() + 9 * 3_600_000);
-    return `${k.getUTCMonth() + 1}/${k.getUTCDate()}(${DOW[k.getUTCDay()]}) ${String(k.getUTCHours()).padStart(2, '0')}:${String(k.getUTCMinutes()).padStart(2, '0')}`;
-  }
-  const airlineName = (code) => AIRLINES[code]?.ko || code;
-  const route = (id) => data.meta.routes.find((r) => r.id === id);
-  const todayKst = () => new Date(Date.now() + 9 * 3_600_000).toISOString().slice(0, 10);
+  const todayKst = () => new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+  const stamp = (iso) => {
+    const k = new Date(Date.parse(iso) + 9 * 3600000);
+    return `${k.getUTCMonth() + 1}/${k.getUTCDate()} ${String(k.getUTCHours()).padStart(2, '0')}:${String(k.getUTCMinutes()).padStart(2, '0')}`;
+  };
+  const googleQ = (q) => `https://www.google.com/travel/flights?hl=ko&curr=KRW&q=${encodeURIComponent(q)}`;
 
-  // ── 예약 링크 ──────────────────────────────────────────
-  function links({ from, to, date, back, airline }) {
-    const yymmdd = (iso) => iso.slice(2).replace(/-/g, '');
-    const air = airline && AIRLINES[airline] ? ` on ${AIRLINES[airline].en}` : '';
-    const q = back
-      ? `Flights from ${from} to ${to} on ${date} through ${back}${air}`
-      : `One-way flights from ${from} to ${to} on ${date}${air}`;
-    return {
-      google: `https://www.google.com/travel/flights?hl=ko&curr=KRW&q=${encodeURIComponent(q)}`,
-      skyscanner: `https://www.skyscanner.co.kr/transport/flights/${from}/${to}/${yymmdd(date)}/${back ? `${yymmdd(back)}/` : ''}?adults=1&currency=KRW&locale=ko-KR&market=KR`,
-      naver: `https://flight.naver.com/flights/international/${from}-${to}-${date.replace(/-/g, '')}${back ? `/${to}-${from}-${back.replace(/-/g, '')}` : ''}?adult=1&fareType=Y`,
-    };
+  // ── 서버 호출 ─────────────────────────────────────────
+  async function api(path, body) {
+    const pin = store.get('pin');
+    if (!pin) throw Object.assign(new Error('PIN이 필요합니다'), { needPin: true });
+    const res = await fetch(`${API()}${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: { 'X-App-Pin': pin, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) throw Object.assign(new Error('PIN이 맞지 않습니다'), { needPin: true });
+    if (!res.ok || data.error) throw new Error(data.error || `서버 오류 (${res.status})`);
+    return data;
   }
 
-  // ── 데이터 도우미 ──────────────────────────────────────
-  function entries(id) {
-    const today = todayKst();
-    return Object.entries(data.routes[id] || {})
-      .filter(([date]) => date >= today)
-      .map(([date, e]) => ({ date, ...e }));
+  const serp = (params) => api('/api/serp', { currency: 'KRW', hl: 'ko', gl: 'kr', adults: '1', deep_search: 'false', ...params });
+
+  function baseParams(code, out, back) {
+    const a = AIRLINES[code];
+    const p = { departure_id: 'ICN', arrival_id: a.dest, outbound_date: out, return_date: back, type: '1' };
+    if (code === 'KE') return { ...p, include_airlines: 'KE', stops: '1' };
+    return { ...p, include_airlines: 'MH,SQ', stops: '2', layover_duration: `${LAYOVER.min},${LAYOVER.max}` };
   }
 
-  function heatLevels(list) {
-    const prices = list.filter((e) => e.price).map((e) => e.price).sort((a, b) => a - b);
-    return (p) => {
-      if (!prices.length) return 0;
-      if (prices.length < 5) {
-        const lo = prices[0];
-        const hi = prices[prices.length - 1];
-        return hi === lo ? 1 : 1 + Math.min(4, Math.floor(((p - lo) / (hi - lo)) * 5));
+  // 구글 결과 한 건 → 작은 형태
+  function toOpt(raw) {
+    const segs = (raw.flights || []).map((f) => {
+      const m = /^\s*([0-9A-Z]{2})\s*(\d{1,4})/i.exec(String(f.flight_number || ''));
+      return {
+        no: m ? `${m[1].toUpperCase()}${m[2]}` : String(f.flight_number || ''),
+        al: m ? m[1].toUpperCase() : '',
+        from: f.departure_airport?.id || '', to: f.arrival_airport?.id || '',
+        dep: String(f.departure_airport?.time || ''), arr: String(f.arrival_airport?.time || ''),
+        min: Number(f.duration) || 0, plane: f.airplane || '',
+      };
+    });
+    const lays = (raw.layovers || []).map((l) => ({ at: l.id || '', min: Number(l.duration) || 0, overnight: Boolean(l.overnight) }));
+    const price = Number(raw.price) > 0 ? Number(raw.price) : null;
+    const total = Number(raw.total_duration) || segs.reduce((s, x) => s + x.min, 0) + lays.reduce((s, x) => s + x.min, 0);
+    const codes = [...new Set(segs.map((s) => s.al))];
+    return { price, total, code: codes.length === 1 ? codes[0] : null, segs, lays, token: raw.departure_token || '', btoken: raw.booking_token || '' };
+  }
+  function fits(o, code) {
+    if (o.code !== code) return false;
+    if (code === 'KE') return o.segs.length === 1;
+    return o.segs.length <= 2 && o.lays.every((l) => l.min >= LAYOVER.min && l.min <= LAYOVER.max);
+  }
+  const flightsKey = (o) => o.segs.map((s) => s.no).join('+');
+  const listOf = (data) => [...(data.best_flights || []), ...(data.other_flights || [])].map(toOpt);
+
+  async function pool(tasks, n, onDone) {
+    let i = 0;
+    const workers = Array.from({ length: n }, async () => {
+      while (i < tasks.length) {
+        const t = tasks[i++];
+        await t();
+        onDone();
       }
-      const rank = prices.filter((x) => x < p).length / prices.length;
-      return 1 + Math.min(4, Math.floor(rank * 5));
+    });
+    await Promise.all(workers);
+  }
+
+  // ── 검색 ─────────────────────────────────────────────
+  function readTrip() {
+    return {
+      out: $('outDate').value,
+      outFlex: Number($('outFlex').value),
+      back: $('backDate').value,
+      backFlex: Number($('backFlex').value),
+      includeKE: $('incKE').checked,
+    };
+  }
+  function combosOf(trip) {
+    const outs = [];
+    const backs = [];
+    for (let d = -trip.outFlex; d <= trip.outFlex; d++) outs.push(addDays(trip.out, d));
+    for (let d = -trip.backFlex; d <= trip.backFlex; d++) backs.push(addDays(trip.back, d));
+    const min = addDays(todayKst(), 1);
+    const combos = [];
+    for (const o of outs) for (const b of backs) if (o >= min && b > o) combos.push({ out: o, back: b });
+    return { outs: outs.filter((o) => o >= min), backs, combos };
+  }
+  function estimate(trip) {
+    const { combos } = combosOf(trip);
+    const codes = trip.includeKE ? 3 : 2;
+    return { combos: combos.length, calls: combos.length * (trip.includeKE ? 2 : 1) + codes };
+  }
+
+  function updateEstimate() {
+    const trip = readTrip();
+    const el = $('estimate');
+    if (!trip.out || !trip.back) { el.textContent = '가는 날과 오는 날을 골라 주세요.'; return; }
+    if (trip.back <= trip.out) { el.textContent = '오는 날이 가는 날보다 뒤여야 합니다.'; return; }
+    const e = estimate(trip);
+    const left = quota?.left;
+    const warn = left != null && left - e.calls < (quota.reserve || 15);
+    el.innerHTML = `날짜 조합 <b>${e.combos}개</b> · 조회 <b>${e.calls}회</b> 사용${left != null ? ` (남은 ${left}회 → 약 ${left - e.calls}회)` : ''}${warn ? ' · <span class="bad">남은 횟수가 부족합니다. ±일수를 줄여 주세요</span>' : ''}`;
+    $('searchBtn').disabled = busy || warn || e.combos === 0;
+  }
+
+  function progress(done, total, label) {
+    $('progress').hidden = false;
+    $('progressBar').style.width = `${Math.round((done / Math.max(1, total)) * 100)}%`;
+    $('progressText').textContent = `${label} ${done}/${total}`;
+  }
+
+  async function runSearch() {
+    const trip = readTrip();
+    const { outs, backs, combos } = combosOf(trip);
+    if (!combos.length || busy) return;
+    const e = estimate(trip);
+    if (!confirm(`조회 ${e.calls}회를 사용해 ${combos.length}개 날짜 조합을 알아봅니다. 진행할까요?`)) return;
+
+    busy = true;
+    updateEstimate();
+    const codes = ['MH', 'SQ', ...(trip.includeKE ? ['KE'] : [])];
+    const result = {
+      createdAt: new Date().toISOString(), trip, outs, backs,
+      conditions: { layoverMin: LAYOVER.min, layoverMax: LAYOVER.max },
+      airlines: codes.map((code) => ({ code, name: AIRLINES[code].ko, matrix: {}, best: null, sel: null })),
+      errors: [],
+    };
+    const byCode = Object.fromEntries(result.airlines.map((a) => [a.code, a]));
+
+    const tasks = [];
+    for (const c of combos) {
+      const key = `${c.out}|${c.back}`;
+      tasks.push(async () => {
+        try {
+          const data = await serp(baseParams('MH', c.out, c.back));
+          const opts = listOf(data);
+          for (const code of ['MH', 'SQ']) {
+            const mine = opts.filter((o) => fits(o, code)).sort((a, b) => (a.price ?? 1e12) - (b.price ?? 1e12));
+            byCode[code].matrix[key] = { price: mine.find((o) => o.price)?.price ?? null, opts: mine.slice(0, 5) };
+          }
+        } catch (err) { result.errors.push(`${md(c.out)}~${md(c.back)} MH/SQ: ${err.message}`); if (err.needPin) throw err; }
+      });
+      if (trip.includeKE) {
+        tasks.push(async () => {
+          try {
+            const data = await serp(baseParams('KE', c.out, c.back));
+            const mine = listOf(data).filter((o) => fits(o, 'KE')).sort((a, b) => (a.price ?? 1e12) - (b.price ?? 1e12));
+            byCode.KE.matrix[key] = { price: mine.find((o) => o.price)?.price ?? null, opts: mine.slice(0, 5) };
+          } catch (err) { result.errors.push(`${md(c.out)}~${md(c.back)} KE: ${err.message}`); if (err.needPin) throw err; }
+        });
+      }
+    }
+
+    try {
+      let done = 0;
+      progress(0, tasks.length, '날짜 조합 조회 중');
+      await pool(tasks, 4, () => progress(++done, tasks.length, '날짜 조합 조회 중'));
+
+      // 항공사별 최저가 날짜 → 오는 편까지 확정
+      const centerKey = `${trip.out}|${trip.back}`;
+      let d2 = 0;
+      progress(0, result.airlines.length, '오는 편 확정 중');
+      await Promise.all(result.airlines.map(async (a) => {
+        const cells = Object.entries(a.matrix).filter(([, v]) => v.opts.length);
+        if (cells.length) {
+          const priced = cells.filter(([, v]) => v.price).sort((x, y) => x[1].price - y[1].price);
+          const [key, cell] = priced[0] || cells.find(([k]) => k === centerKey) || cells[0];
+          const [out, back] = key.split('|');
+          const opt = cell.opts.find((o) => o.price === cell.price) || cell.opts[0];
+          a.best = { out, back, price: cell.price, flights: flightsKey(opt) };
+          try { a.sel = await detail(a.code, out, back, opt); } catch (err) { result.errors.push(`${a.name} 오는 편: ${err.message}`); }
+          if (a.sel?.price) { a.best.price = a.sel.price; cell.price = a.sel.price; cell.confirmed = true; }
+        }
+        progress(++d2, result.airlines.length, '오는 편 확정 중');
+      }));
+
+      state.result = result;
+      state.trip = trip;
+      store.set('trip', JSON.stringify(trip));
+      render();
+      await saveState();
+      $('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (err) {
+      if (err.needPin) askPin(err.message);
+      else alert(`조회 중 문제가 생겼습니다: ${err.message}`);
+    } finally {
+      busy = false;
+      $('progress').hidden = true;
+      refreshQuota();
+    }
+  }
+
+  // 가는 편 하나를 골라 오는 편을 확정합니다 (조회 1회, 실패 시 다시 조회 +1회)
+  async function detail(code, out, back, opt) {
+    const base = baseParams(code, out, back);
+    let data;
+    try {
+      data = await serp({ ...base, departure_token: opt.token });
+      if (data.error) throw new Error(data.error);
+    } catch {
+      const fresh = listOf(await serp(base)).find((o) => flightsKey(o) === flightsKey(opt));
+      if (!fresh) throw new Error('이 항공편이 더 이상 조회되지 않습니다');
+      data = await serp({ ...base, departure_token: fresh.token });
+    }
+    const rets = listOf(data).filter((o) => fits(o, code)).sort((a, b) => (a.price ?? 1e12) - (b.price ?? 1e12));
+    const ret = rets[0];
+    if (!ret) {
+      const other = listOf(data).filter((o) => o.code === code).sort((a, b) => (a.price ?? 1e12) - (b.price ?? 1e12))[0];
+      return {
+        out, back, price: null, outOpt: { ...opt, token: '' }, retOpt: null, returns: [], noReturn: true,
+        noReturnNote: other ? `조건 밖 오는 편: ${other.segs.map((x) => x.no).join('+')} (${other.lays.map((l) => `대기 ${hm(l.min)}`).join(', ') || '직항'})` : '',
+        bookingToken: '', googleUrl: data.search_metadata?.google_flights_url || '', at: new Date().toISOString(),
+      };
+    }
+    return {
+      out, back, price: ret.price, outOpt: { ...opt, token: '' }, retOpt: { ...ret, token: '' },
+      returns: rets.slice(1, 4).map((r) => ({ ...r, token: '' })),
+      bookingToken: ret.btoken, googleUrl: data.search_metadata?.google_flights_url || '', at: new Date().toISOString(),
     };
   }
 
-  function prevPrice(e) {
-    const h = (e.history || []).filter((x) => x.p);
-    return h.length >= 2 ? h[h.length - 2].p : null;
+  async function saveState() {
+    try { await api('/api/state', { trip: state.trip, result: state.result }); } catch { /* 저장 실패해도 화면은 유지 */ }
   }
 
-  function deltaHtml(e) {
-    const prev = prevPrice(e);
-    if (!prev || !e.price || prev === e.price) return '';
-    const diff = e.price - prev;
-    const cls = diff < 0 ? 'down' : 'up';
-    return `<div class="delta ${cls}">${diff < 0 ? '▼' : '▲'}${Math.abs(Math.round(diff / 1000)).toLocaleString('ko-KR')}천원</div>`;
+  // ── 그리기 ───────────────────────────────────────────
+  function segHtml(o) {
+    let h = '';
+    const d0 = o.segs[0]?.dep.slice(0, 10);
+    o.segs.forEach((s, j) => {
+      const plus = s.arr.slice(0, 10) > d0 ? '<small>+1</small>' : '';
+      h += `<div class="leg"><span class="no">${esc(s.no)}</span><span class="t">${hhmm(s.dep)} ${esc(AIRPORTS[s.from] || s.from)} → ${hhmm(s.arr)}${plus} ${esc(AIRPORTS[s.to] || s.to)} <span class="muted">· 비행 ${hm(s.min)}</span></span></div>`;
+      if (o.lays[j]) h += `<div class="lay">⏱ ${esc(AIRPORTS[o.lays[j].at] || o.lays[j].at)}에서 ${hm(o.lays[j].min)} 대기${o.lays[j].overnight ? ' (밤샘)' : ''}</div>`;
+    });
+    return h;
+  }
+  function flySummary(o) {
+    const f = o.segs[0];
+    const l = o.segs[o.segs.length - 1];
+    const plus = l.arr.slice(0, 10) > f.dep.slice(0, 10) ? '+1' : '';
+    const lay = o.lays.length ? `${AIRPORTS[o.lays[0].at] || o.lays[0].at} ${hm(o.lays[0].min)} 대기` : '직항';
+    return { time: `${hhmm(f.dep)} → ${hhmm(l.arr)}${plus}`, lay, total: hm(o.total) };
   }
 
-  function summary(opt) {
-    const first = opt.segs[0];
-    const last = opt.segs[opt.segs.length - 1];
-    const via = opt.lays.map((l) => `${AIRPORTS[l.at] || l.at} ${hm(l.min)} 대기`).join(', ') || '직항';
-    const plus = last.arr.slice(0, 10) > first.dep.slice(0, 10) ? '+1' : '';
-    return `${opt.airlines.map(airlineName).join('·')} · ${hhmm(first.dep)}→${hhmm(last.arr)}${plus} · ${via}`;
+  // 대한항공: 가장 빠른 "집 도착" 육상 수단
+  function keGround(sel) {
+    if (!sel?.outOpt?.segs?.length || !window.Ground) return null;
+    const arr = sel.outOpt.segs[sel.outOpt.segs.length - 1].arr;
+    const dep = sel.retOpt?.segs?.[0]?.dep;
+    const g = window.Ground.outbound(arr);
+    const gi = dep ? window.Ground.inbound(dep) : null;
+    const fastest = g.options.filter((o) => o.ok && o.home).sort((a, b) => a.home - b.home)[0];
+    const cheapest = g.options.filter((o) => o.ok).sort((a, b) => a.rm[0] - b.rm[0])[0];
+    return { g, gi, fastest, cheapest };
   }
 
-  // ── 그리기 ────────────────────────────────────────────
-  function renderHeader() {
-    const m = data.meta;
-    const c = m.conditions;
-    const q = m.quota || {};
-    const hours = (Date.now() - Date.parse(m.updatedAt)) / 3_600_000;
-    $('status').textContent = `업데이트 ${stamp(m.updatedAt)}${hours > 36 ? ' ⚠️ 오래됨' : ''}`;
-    $('chips').innerHTML = [
-      c.airlines.map(airlineName).join('·'),
-      `경유 ${c.maxStops}회 이하`,
-      `대기 ${hm(c.layoverMinMinutes)}~${hm(c.layoverMaxMinutes)}`,
-      `${c.daysAheadMin}~${c.daysAheadMax}일 뒤 출발`,
-    ].map((t) => `<span class="chip">${esc(t)}</span>`).join('');
-    $('foot').innerHTML = `구글 플라이트 실시간 시세 · 1인 편도 · 남은 무료 조회 ${q.left ?? '?'}회${q.renewal ? ` (${md(q.renewal)} 초기화)` : ''}<br>가격은 확인한 시점 기준입니다. 예약 전 링크에서 최종가를 확인하세요.`;
-  }
-
-  function renderTabs() {
-    $('routeTabs').innerHTML = data.meta.routes
-      .map((r) => `<button role="tab" data-route="${r.id}" aria-selected="${r.id === routeId}">${esc(r.label)}</button>`)
-      .join('');
-    $('stayTabs').innerHTML = STAYS
-      .map((s) => `<button data-stay="${s.id}" aria-selected="${s.id === stayId}">${s.label}</button>`)
-      .join('');
-  }
-
-  function renderTop() {
-    const list = entries(routeId).filter((e) => e.price).sort((a, b) => a.price - b.price).slice(0, 5);
-    const all = entries(routeId);
-    $('topHint').textContent = `${all.length}일 확인됨`;
-    if (!list.length) {
-      $('topList').innerHTML = `<li class="empty">아직 확인한 날짜가 없습니다. 매일 조금씩 채워집니다.</li>`;
-      return;
-    }
-    $('topList').innerHTML = list.map((e, i) => `
-      <li><button class="row" data-date="${e.date}" data-route="${routeId}">
-        <span class="rank">${i + 1}</span>
-        <span class="row-main">
-          <div class="row-date">${mdw(e.date)} <span class="age${ageDays(e.checkedAt) > STALE_DAYS ? ' stale' : ''}">· ${ageText(e.checkedAt)}</span></div>
-          <div class="row-sub">${esc(summary(e.options[0]))}</div>
-        </span>
-        <span class="row-price"><div class="price">${won(e.price)}</div>${deltaHtml(e)}</span>
-      </button></li>`).join('');
-  }
-
-  function renderCalendar() {
-    const today = todayKst();
-    const c = data.meta.conditions;
-    const start = addDays(today, c.daysAheadMin);
-    const end = addDays(today, c.daysAheadMax);
-    const list = entries(routeId);
-    const byDate = Object.fromEntries(list.map((e) => [e.date, e]));
-    const level = heatLevels(list);
-    const best = list.filter((e) => e.price).sort((a, b) => a.price - b.price)[0];
-
-    $('legend').innerHTML = `싸다 <i style="background:var(--heat-1)"></i><i style="background:var(--heat-2)"></i><i style="background:var(--heat-3)"></i><i style="background:var(--heat-4)"></i><i style="background:var(--heat-5)"></i> 비싸다 · 흐린 칸 = ${STALE_DAYS}일 넘게 안 봄 · 점선 = 아직 안 봄`;
-
-    let html = '';
-    let cursor = `${start.slice(0, 7)}-01`;
-    while (cursor <= end) {
-      const d0 = parse(cursor);
-      const y = d0.getUTCFullYear();
-      const m = d0.getUTCMonth();
-      const days = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
-      html += `<div class="month"><h4>${y}년 ${m + 1}월</h4><div class="grid">`;
-      html += DOW.map((w, i) => `<div class="dow${i === 0 ? ' sun' : ''}">${w}</div>`).join('');
-      for (let i = 0; i < d0.getUTCDay(); i++) html += '<div class="cell blank"></div>';
-      for (let day = 1; day <= days; day++) {
-        const iso = `${y}-${String(m + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-        const e = byDate[iso];
-        if (iso < start || iso > end) {
-          html += `<div class="cell out"><span class="d">${day}</span><span class="p"></span></div>`;
-        } else if (!e) {
-          html += `<div class="cell none"><span class="d">${day}</span><span class="p">·</span></div>`;
-        } else if (!e.price) {
-          html += `<button class="cell none noflight${ageDays(e.checkedAt) > STALE_DAYS ? ' old' : ''}" data-date="${iso}" data-route="${routeId}"><span class="d">${day}</span><span class="p">없음</span></button>`;
-        } else {
-          const cls = ['cell', 'has', `h${level(e.price)}`];
-          if (ageDays(e.checkedAt) > STALE_DAYS) cls.push('old');
-          if (best && best.date === iso) cls.push('best');
-          html += `<button class="${cls.join(' ')}" data-date="${iso}" data-route="${routeId}" aria-label="${mdw(iso)} ${won(e.price)}"><span class="d">${day}</span><span class="p">${man(e.price)}</span></button>`;
+  function renderCompare() {
+    const r = state.result;
+    const fx = quota?.fx?.krw || 320;
+    const prices = r.airlines.map((a) => a.sel?.price).filter(Boolean);
+    const low = prices.length ? Math.min(...prices) : null;
+    const cards = r.airlines.map((a) => {
+      const s = a.sel;
+      if (!s) return `<button class="cmp-card off" data-jump="${a.code}"><div class="cmp-top"><b>${esc(a.name)}</b><span class="muted">조건에 맞는 항공편 없음</span></div></button>`;
+      if (s.noReturn) {
+        const f = flySummary(s.outOpt);
+        return `<button class="cmp-card off" data-jump="${a.code}"><div class="cmp-top"><b>${esc(a.name)}</b><span class="bad small">오는 편 조건 불충족</span></div>
+          <div class="cmp-row">가는 편 ${mdw(s.out)} ${f.time} · ${esc(f.lay)}</div><div class="cmp-row muted">${mdw(s.back)} 오는 편 중 대기 ${hm(LAYOVER.min)}~${hm(LAYOVER.max)}인 편이 없음</div></button>`;
+      }
+      const fo = flySummary(s.outOpt);
+      const fr = flySummary(s.retOpt);
+      let door = s.outOpt.total + PRE_TRIP + POST_PEN;
+      let extra = '';
+      if (a.code === 'KE') {
+        const k = keGround(s);
+        if (k?.fastest) {
+          door = s.outOpt.total + PRE_TRIP + (k.fastest.home - k.g.arrival);
+          extra = `<div class="cmp-row muted">+ 쿠알라룸푸르→페낭 ${esc(k.fastest.name)} 약 ${won(k.fastest.rm[0] * fx)}부터</div>`;
         }
       }
-      html += '</div></div>';
-      cursor = new Date(Date.UTC(y, m + 1, 1)).toISOString().slice(0, 10);
-    }
-    $('calendar').innerHTML = html;
+      return `<button class="cmp-card${s.price === low ? ' best' : ''}" data-jump="${a.code}">
+        <div class="cmp-top"><b>${esc(a.name)}${s.price === low ? ' <span class="tag">최저</span>' : ''}</b><span class="price">${won(s.price)}</span></div>
+        <div class="cmp-row"><span class="lbl">가는 편</span>${mdw(s.out)} ${fo.time} · ${esc(fo.lay)} · 총 ${fo.total}</div>
+        <div class="cmp-row"><span class="lbl">오는 편</span>${mdw(s.back)} ${fr.time} · ${esc(fr.lay)} · 총 ${fr.total}</div>
+        ${extra}
+        <div class="cmp-row muted">집 → 페낭 집 약 ${hm(door)}</div>
+      </button>`;
+    }).join('');
+    $('compare').innerHTML = `${cards}
+      <p class="note">조회 ${stamp(r.createdAt)} · 왕복 1인 · 경유 대기 ${hm(LAYOVER.min)}~${hm(LAYOVER.max)} · 대한항공은 인천⇄쿠알라룸푸르 직항 가격${r.errors?.length ? ` · <span class="bad">일부 조회 실패 ${r.errors.length}건</span>` : ''}</p>`;
   }
 
-  function renderCombos() {
-    const stay = STAYS.find((s) => s.id === stayId) || STAYS[0];
-    const [outId, backId] = [data.meta.routes[0].id, data.meta.routes[1].id];
-    const outs = entries(outId).filter((e) => e.price);
-    const backs = entries(backId).filter((e) => e.price);
-    const combos = [];
-    for (const o of outs) {
-      for (const b of backs) {
-        const n = diffDays(o.date, b.date);
-        if (n >= stay.min && n <= stay.max) combos.push({ o, b, n, total: o.price + b.price });
+  function matrixHtml(a) {
+    const r = state.result;
+    const cells = Object.values(a.matrix).map((c) => c.price).filter(Boolean);
+    const lo = cells.length ? Math.min(...cells) : 0;
+    const hi = cells.length ? Math.max(...cells) : 0;
+    let h = `<div class="table-wrap"><table class="mx"><thead><tr><th class="corner">가는 ↓ / 오는 →</th>${r.backs.map((b) => `<th>${mdw(b)}</th>`).join('')}</tr></thead><tbody>`;
+    for (const o of r.outs) {
+      h += `<tr><th>${mdw(o)}</th>`;
+      for (const b of r.backs) {
+        const c = a.matrix[`${o}|${b}`];
+        if (!c) { h += '<td class="na">—</td>'; continue; }
+        if (!c.opts.length) { h += '<td class="na">없음</td>'; continue; }
+        const lvl = c.price == null ? '' : hi === lo ? 'l1' : `l${1 + Math.min(3, Math.floor(((c.price - lo) / (hi - lo)) * 4))}`;
+        const sel = a.sel && a.sel.out === o && a.sel.back === b ? ' sel' : '';
+        h += `<td><button class="mxc ${lvl}${sel}${c.price === lo ? ' low' : ''}" data-pick="${a.code}|${o}|${b}">${c.price ? man(c.price) : '?'}</button></td>`;
       }
+      h += '</tr>';
     }
-    combos.sort((a, b) => a.total - b.total);
-    if (!combos.length) {
-      $('comboList').innerHTML = `<li class="empty">이 기간에 맞는 조합이 아직 없습니다. 날짜가 더 채워지면 나타납니다.</li>`;
-      return;
-    }
-    const r0 = route(outId);
-    $('comboList').innerHTML = combos.slice(0, 5).map((c, i) => {
-      const l = links({ from: r0.from, to: r0.to, date: c.o.date, back: c.b.date });
-      return `<li><div class="row combo">
-        <span class="rank">${i + 1}</span>
-        <span class="row-main">
-          <div class="combo-dates"><span>${mdw(c.o.date)} → ${mdw(c.b.date)} <span class="age">· ${c.n}박</span></span><span class="price">${won(c.total)}</span></div>
-          <div class="combo-legs">가는 편 ${won(c.o.price)} (${esc(c.o.options[0].airlines.map(airlineName).join('·'))}) + 오는 편 ${won(c.b.price)} (${esc(c.b.options[0].airlines.map(airlineName).join('·'))})</div>
-          <div class="combo-legs"><a href="${l.google}" target="_blank" rel="noopener">구글 왕복 비교</a> · <a href="${l.skyscanner}" target="_blank" rel="noopener">스카이스캐너</a> · <a href="${l.naver}" target="_blank" rel="noopener">네이버</a></div>
-        </span>
-      </div></li>`;
-    }).join('');
+    return `${h}</tbody></table></div><p class="note">단위 만원 · 칸을 누르면 그 날짜로 오는 편까지 확정 (조회 1회)</p>`;
   }
 
-  function renderEvents() {
-    const ev = (data.events || []).slice(0, 8);
-    if (!ev.length) {
-      $('events').innerHTML = `<li class="empty">아직 변동 소식이 없습니다.</li>`;
-      return;
-    }
-    $('events').innerHTML = ev.map((e) => {
-      const r = route(e.route);
-      const tag = e.type === 'newLow' ? '최저가' : '가격 내림';
-      const body = e.type === 'newLow'
-        ? `${esc(r?.label)} ${mdw(e.date)} ${won(e.price)}`
-        : `${esc(r?.label)} ${mdw(e.date)} ${won(e.prev)} → <b>${won(e.price)}</b>`;
-      return `<li><span class="tag">${tag}</span><span>${body}</span><span class="when">${stamp(e.at).split(' ')[0]}</span></li>`;
-    }).join('');
-  }
+  function groundHtml(sel) {
+    const k = keGround(sel);
+    if (!k) return '';
+    const fx = quota?.fx?.krw || 320;
+    const krw = (rm) => `${won(rm[0] * fx)}${rm[1] !== rm[0] ? `~${Math.round((rm[1] * fx) / 1000).toLocaleString('ko-KR')}천원` : ''}`;
+    const arrivalStr = sel.outOpt.segs[sel.outOpt.segs.length - 1].arr;
+    const depStr = sel.retOpt?.segs?.[0]?.dep || '';
 
-  function sparkline(history) {
-    const pts = (history || []).filter((h) => h.p);
-    if (pts.length < 2) return '';
-    const ps = pts.map((h) => h.p);
-    const lo = Math.min(...ps);
-    const hi = Math.max(...ps);
-    const W = 300;
-    const H = 50;
-    const xy = pts.map((h, i) => [
-      (i / (pts.length - 1)) * (W - 8) + 4,
-      hi === lo ? H / 2 : H - 6 - ((h.p - lo) / (hi - lo)) * (H - 12),
-    ]);
-    const path = xy.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
-    const [lx, ly] = xy[xy.length - 1];
-    return `<div class="spark"><div class="cap"><span>이 날짜 가격 흐름 (${pts.length}번 확인)</span><span>${won(lo)} ~ ${won(hi)}</span></div>
-      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="가격 흐름"><path d="${path}" fill="none" stroke="var(--brand)" stroke-width="2" vector-effect="non-scaling-stroke"/><circle cx="${lx}" cy="${ly}" r="3.5" fill="var(--brand)"/></svg></div>`;
-  }
+    const outRows = k.g.options
+      .slice()
+      .sort((a, b) => (b.ok - a.ok) || ((a.home || 9e12) - (b.home || 9e12)))
+      .map((o) => `<div class="gopt${o.ok ? '' : ' off'}${k.fastest === o ? ' best' : ''}">
+        <div class="gh"><span>${o.icon} <b>${esc(o.name)}</b>${k.fastest === o ? ' <span class="tag">가장 빠름</span>' : ''}${o.hotel ? ' <span class="tag warn">1박 필요</span>' : ''}</span><span class="price">${o.ok ? krw(o.rm) : '불가'}</span></div>
+        ${o.ok ? `<div class="gm">${o.departClock} 출발 → <b>집 ${o.homeDate !== arrivalStr.slice(0, 10) ? `${md(o.homeDate)} ` : ''}${o.homeClock}</b> 도착 · 공항 도착부터 ${hm(o.home - k.g.arrival)} · RM ${o.rm[0]}~${o.rm[1]}</div>` : ''}
+        <div class="gd">${esc(o.detail)}</div>
+        <div class="gl">${o.links.map((l) => `<a href="${l.url}" target="_blank" rel="noopener">${esc(l.name)}</a>`).join(' · ')}${o.google ? `<a href="${googleQ(o.google)}" target="_blank" rel="noopener">구글 플라이트에서 국내선 보기</a>` : ''}</div>
+      </div>`).join('');
 
-  function openSheet(id, date) {
-    const r = route(id);
-    const e = data.routes[id]?.[date];
-    if (!r || !e) return;
-    $('sheetSub').textContent = `${r.label} · 편도 1인 · ${ageText(e.checkedAt)}`;
-    $('sheetTitle').textContent = `${date.slice(0, 4)}년 ${mdw(date)}`;
+    const inRows = k.gi ? k.gi.options
+      .slice()
+      .sort((a, b) => b.leave - a.leave)
+      .map((o) => `<div class="gopt${o.hotel ? ' warnbox' : ''}">
+        <div class="gh"><span>${o.icon} <b>${esc(o.name)}</b>${o.hotel ? ' <span class="tag warn">전날 이동</span>' : ''}</span><span class="price">${krw(o.rm)}</span></div>
+        <div class="gm">집에서 <b>${o.leaveDate !== depStr.slice(0, 10) ? `${md(o.leaveDate)} ` : ''}${o.leaveClock}</b>까지 출발 → 공항 ${o.arriveClock} · 이동 ${hm(o.ride)} · RM ${o.rm[0]}~${o.rm[1]}</div>
+        <div class="gd">${esc(o.detail)}</div>
+        <div class="gl">${o.links.map((l) => `<a href="${l.url}" target="_blank" rel="noopener">${esc(l.name)}</a>`).join(' · ')}${o.google ? `<a href="${googleQ(o.google)}" target="_blank" rel="noopener">구글 플라이트에서 국내선 보기</a>` : ''}</div>
+      </div>`).join('') : '';
 
-    let body = '';
-    if (!e.options?.length) {
-      body += `<p class="empty">이날은 조건(항공사·경유 대기시간)에 맞는 항공편이 없었습니다.</p>`;
-    }
-    e.options.forEach((o, i) => {
-      body += `<div class="opt${i === 0 ? ' first' : ''}">
-        <div class="opt-head"><span class="opt-air">${esc(o.airlines.map(airlineName).join(' · '))}</span><span class="price">${won(o.price)}</span></div>
-        <div class="opt-meta">총 ${hm(o.total)} · 경유 ${o.lays.length}회</div>`;
-      o.segs.forEach((s, j) => {
-        const nextDay = s.arr.slice(0, 10) > o.segs[0].dep.slice(0, 10) ? ' <small>+1</small>' : '';
-        body += `<div class="leg"><span class="no">${esc(s.no)}</span><span class="t">${hhmm(s.dep)} ${esc(AIRPORTS[s.from] || s.from)} → ${hhmm(s.arr)}${nextDay} ${esc(AIRPORTS[s.to] || s.to)}</span></div>`;
-        if (o.lays[j]) body += `<div class="lay">⏱ ${esc(AIRPORTS[o.lays[j].at] || o.lays[j].at)}에서 ${hm(o.lays[j].min)} 대기${o.lays[j].overnight ? ' (밤샘)' : ''}</div>`;
-      });
-      body += '</div>';
-    });
-
-    body += sparkline(e.history);
-
-    const topAir = e.options?.[0]?.airlines?.length === 1 ? e.options[0].airlines[0] : null;
-    const l = links({ from: r.from, to: r.to, date, airline: topAir });
-    const lAll = links({ from: r.from, to: r.to, date });
-    body += `<div class="links">
-      <a class="btn primary" href="${l.google}" target="_blank" rel="noopener">구글 플라이트에서 지금 가격 보기${topAir ? ` (${airlineName(topAir)})` : ''}</a>
-      <a class="btn" href="${lAll.skyscanner}" target="_blank" rel="noopener">스카이스캐너</a>
-      <a class="btn" href="${lAll.naver}" target="_blank" rel="noopener">네이버항공권</a>
-      ${topAir ? `<a class="btn" href="${AIRLINES[topAir].site}" target="_blank" rel="noopener">${airlineName(topAir)} 홈페이지</a>` : ''}
-      <a class="btn" href="${lAll.google}" target="_blank" rel="noopener">구글 (전체 항공사)</a>
+    return `<div class="ground">
+      <h4>🧭 쿠알라룸푸르 ↔ 페낭 이동수단 전체 비교</h4>
+      <div class="seg small">
+        <button data-gtab="out" aria-selected="${groundTab === 'out'}">가는 길 (${hhmm(arrivalStr)} 도착 후)</button>
+        <button data-gtab="in" aria-selected="${groundTab === 'in'}">오는 길 (${depStr ? hhmm(depStr) : '-'} 출발 전)</button>
+      </div>
+      ${groundTab === 'out' ? outRows : `<p class="note">국제선 3시간 전(${k.gi?.atAirportClock}) KLIA T1 도착 기준으로 거꾸로 계산했습니다.</p>${inRows}`}
+      <p class="note">1링깃 ≈ ${Math.round(fx)}원 (${quota?.fx?.at ? '오늘 환율' : '대략값'}) · 1인 기준, 전세차는 차 1대(1~4인) 값 · 시간표·요금은 ${window.Ground.SURVEYED} 조사, 예약 전 사이트에서 확인</p>
     </div>`;
-
-    $('sheetBody').innerHTML = body;
-    const sheet = $('sheet');
-    if (typeof sheet.showModal === 'function') sheet.showModal();
-    else sheet.setAttribute('open', '');
   }
 
-  function renderAll() {
-    if (!data.meta.routes.some((r) => r.id === routeId)) routeId = data.meta.routes[0].id;
-    renderHeader();
-    renderTabs();
-    renderTop();
-    renderCalendar();
-    renderCombos();
-    renderEvents();
+  function airlineCard(a) {
+    const s = a.sel;
+    const info = AIRLINES[a.code];
+    if (!s) {
+      return `<section class="card air" id="air-${a.code}"><div class="card-head"><h2>${esc(a.name)}</h2></div>
+        <p class="empty">이 기간에 조건(${a.code === 'KE' ? '쿠알라룸푸르 직항' : `1회 경유 · 대기 ${hm(LAYOVER.min)}~${hm(LAYOVER.max)}`})에 맞는 항공편이 없습니다.</p>
+        ${Object.keys(a.matrix).length ? matrixHtml(a) : ''}</section>`;
+    }
+    if (s.noReturn) {
+      return `<section class="card air" id="air-${a.code}"><div class="air-head"><div><h2>${esc(a.name)}</h2><div class="muted">${mdw(s.out)} ~ ${mdw(s.back)}</div></div><div class="big muted">—</div></div>
+        ${matrixHtml(a)}
+        <div class="way"><div class="way-h">✈️ 가는 편 ${mdw(s.out)} <span class="muted">총 ${hm(s.outOpt.total)}</span></div>${segHtml(s.outOpt)}</div>
+        <p class="bad small">${mdw(s.back)}에는 경유 대기 ${hm(LAYOVER.min)}~${hm(LAYOVER.max)}에 맞는 오는 편이 없습니다. 오는 날을 ±일로 넓혀 보세요.${s.noReturnNote ? `<br>${esc(s.noReturnNote)}` : ''}</p>
+        <div class="actions"><a class="btn" href="${s.googleUrl || googleQ(`Flights from ICN to PEN on ${s.out} through ${s.back} on ${info.en}`)}" target="_blank" rel="noopener">구글 플라이트</a><a class="btn" href="${info.site}" target="_blank" rel="noopener">${esc(a.name)} 홈페이지</a></div>
+      </section>`;
+    }
+    const cell = a.matrix[`${s.out}|${s.back}`];
+    const alts = (cell?.opts || []).filter((o) => flightsKey(o) !== flightsKey(s.outOpt));
+    const gq = googleQ(`Flights from ICN to ${info.dest} on ${s.out} through ${s.back} on ${info.en}`);
+    return `<section class="card air" id="air-${a.code}">
+      <div class="air-head">
+        <div><h2>${esc(a.name)}</h2><div class="muted">${mdw(s.out)} ~ ${mdw(s.back)} · 왕복 1인${a.code === 'KE' ? ' · 인천⇄쿠알라룸푸르' : ''}</div></div>
+        <div class="big">${won(s.price)}</div>
+      </div>
+      ${matrixHtml(a)}
+      <div class="way"><div class="way-h">✈️ 가는 편 ${mdw(s.out)} <span class="muted">총 ${hm(s.outOpt.total)}</span></div>${segHtml(s.outOpt)}</div>
+      ${alts.length ? `<details class="alts"><summary>같은 날 다른 시간 ${alts.length}개</summary>${alts.map((o, i) => {
+        const f = flySummary(o);
+        return `<button class="alt" data-alt="${a.code}|${i}"><span>${f.time} · ${esc(f.lay)} · ${f.total}</span><span>${o.price ? won(o.price) : '가격 확인'}</span></button>`;
+      }).join('')}</details>` : ''}
+      <div class="way"><div class="way-h">✈️ 오는 편 ${mdw(s.back)} <span class="muted">총 ${hm(s.retOpt.total)}</span></div>${segHtml(s.retOpt)}</div>
+      ${s.returns?.length ? `<p class="note">오는 편 다른 시간: ${s.returns.map((o) => { const f = flySummary(o); return `${f.time}(${f.lay}) ${o.price ? won(o.price) : ''}`; }).map(esc).join(' / ')} — 예약 사이트에서 바꿔 고를 수 있습니다</p>` : ''}
+      <div class="actions">
+        <button class="btn primary" data-book="${a.code}">🎫 예약하기 · 예약처 가격 비교</button>
+        <a class="btn" href="${s.googleUrl || gq}" target="_blank" rel="noopener">구글 플라이트</a>
+        <a class="btn" href="${info.site}" target="_blank" rel="noopener">${esc(a.name)} 홈페이지</a>
+      </div>
+      <div class="vendors" id="vendors-${a.code}"></div>
+      <p class="note">확정 ${stamp(s.at)} 기준</p>
+      ${a.code === 'KE' ? groundHtml(s) : ''}
+    </section>`;
   }
 
-  async function load() {
-    const btn = $('reload');
-    btn.classList.add('spin');
+  function renderWatch() {
+    const r = state.result;
+    const lr = state.lastRecheck;
+    const rows = r.airlines.filter((a) => a.best && a.sel && !a.sel.noReturn).map((a) => {
+      const w = a.watch;
+      const base = a.sel?.price ?? a.best.price;
+      const hist = (a.watchHistory || []).filter((x) => x.p);
+      const diff = hist.length >= 2 ? hist[hist.length - 1].p - hist[hist.length - 2].p : 0;
+      return `<li><span><b>${esc(a.name)}</b> ${md(a.best.out)}~${md(a.best.back)}</span><span>${w ? `${won(w.price)} ${diff ? `<span class="${diff < 0 ? 'good' : 'bad'}">${diff < 0 ? '▼' : '▲'}${Math.abs(Math.round(diff / 1000)).toLocaleString('ko-KR')}천</span>` : ''}` : won(base)}</span></li>`;
+    }).join('');
+    $('watch').innerHTML = `<ul class="watch">${rows}</ul>
+      <p class="note">오른쪽 금액은 매일 아침 7시에 다시 확인한 시세(항공사 최저 표시가)이고, 직전 확인보다 3% 또는 1만원 이상 바뀌면 휴대폰 알림을 보냅니다. 예약 전 최종가는 항공사 카드의 예약하기에서 확인하세요.${lr ? ` 마지막 확인 ${stamp(lr.at)}${lr.changes?.length ? ` · 변동 ${lr.changes.length}건` : ' · 변동 없음'}` : ''}</p>`;
+  }
+
+  function render() {
+    const has = Boolean(state.result?.airlines);
+    $('results').hidden = !has;
+    if (!has) return;
+    renderCompare();
+    $('airCards').innerHTML = state.result.airlines.map(airlineCard).join('');
+    renderWatch();
+  }
+
+  // ── 예약 ─────────────────────────────────────────────
+  async function loadVendors(code) {
+    const a = state.result.airlines.find((x) => x.code === code);
+    const box = $(`vendors-${code}`);
+    if (!a?.sel) return;
+    box.innerHTML = '<p class="loading">예약처와 최종 가격을 불러오는 중… (15초쯤 걸립니다 · 조회 1회)</p>';
     try {
-      const res = await fetch(`data/prices.json?t=${Date.now()}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      data = await res.json();
-      if (!data.meta?.routes) throw new Error('아직 데이터가 없습니다');
-      renderAll();
+      let data = null;
+      if (a.sel.bookingToken) {
+        data = await serp({ ...baseParams(code, a.sel.out, a.sel.back), booking_token: a.sel.bookingToken }).catch(() => null);
+      }
+      if (!data?.booking_options?.length) {
+        // 오래돼서 만료됐으면 오는 편부터 다시 확정
+        const cell = a.matrix[`${a.sel.out}|${a.sel.back}`];
+        const fresh = listOf(await serp(baseParams(code, a.sel.out, a.sel.back))).find((o) => flightsKey(o) === flightsKey(a.sel.outOpt)) || cell?.opts?.[0];
+        a.sel = await detail(code, a.sel.out, a.sel.back, fresh);
+        data = await serp({ ...baseParams(code, a.sel.out, a.sel.back), booking_token: a.sel.bookingToken });
+      }
+      const vendors = (data.booking_options || [])
+        .map((o) => o.together || o.departing)
+        .filter((v) => v?.booking_request?.url)
+        .sort((x, y) => (x.price || 1e12) - (y.price || 1e12));
+      if (!vendors.length) throw new Error('예약처 정보가 없습니다');
+      const airlineVendor = (v) => /항공|airlines|air$|korean air|대한/i.test(v.book_with || '');
+      box.innerHTML = `<p class="note">누르면 해당 사이트의 <b>이 일정 예약 화면</b>으로 바로 이동합니다. 가격 낮은 순.</p>
+        ${vendors.map((v, i) => `<button class="vendor${airlineVendor(v) ? ' direct' : ''}" data-vendor="${code}|${i}">
+          <span><b>${esc(v.book_with)}</b>${airlineVendor(v) ? ' <span class="tag">항공사 직접</span>' : ''}${i === 0 ? ' <span class="tag">최저</span>' : ''}
+          <span class="muted small">${esc((v.baggage_prices || []).join(' · '))}</span></span>
+          <span class="price">${v.price ? won(v.price) : '-'}</span></button>`).join('')}`;
+      box._vendors = vendors;
+      saveState();
     } catch (err) {
-      if (!data) $('status').textContent = `불러오지 못했습니다 (${err.message})`;
-    } finally {
-      btn.classList.remove('spin');
+      if (err.needPin) return askPin(err.message);
+      box.innerHTML = `<p class="bad">예약처를 불러오지 못했습니다: ${esc(err.message)}. 위의 구글 플라이트 버튼으로 이동해 주세요.</p>`;
     }
   }
 
-  // ── 이벤트 ────────────────────────────────────────────
+  function openVendor(v) {
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = v.booking_request.url;
+    form.target = '_blank';
+    form.rel = 'noopener';
+    for (const part of String(v.booking_request.post_data || '').split('&')) {
+      if (!part) continue;
+      const i = part.indexOf('=');
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = decodeURIComponent(i < 0 ? part : part.slice(0, i));
+      input.value = i < 0 ? '' : decodeURIComponent(part.slice(i + 1).replace(/\+/g, ' '));
+      form.appendChild(input);
+    }
+    document.body.appendChild(form);
+    form.submit();
+    form.remove();
+  }
+
+  async function pick(code, out, back, opt) {
+    const a = state.result.airlines.find((x) => x.code === code);
+    const card = $(`air-${code}`);
+    card.classList.add('loading-card');
+    try {
+      a.sel = await detail(code, out, back, opt);
+      const cell = a.matrix[`${out}|${back}`];
+      if (a.sel.price && cell) { cell.price = a.sel.price; cell.confirmed = true; }
+      if (a.sel.price && (!a.best?.price || a.sel.price < a.best.price)) a.best = { out, back, price: a.sel.price, flights: flightsKey(a.sel.outOpt) };
+      render();
+      $(`air-${code}`).scrollIntoView({ behavior: 'smooth', block: 'start' });
+      saveState();
+    } catch (err) {
+      if (err.needPin) askPin(err.message);
+      else alert(err.message);
+    } finally {
+      card.classList.remove('loading-card');
+      refreshQuota();
+    }
+  }
+
+  // ── 기타 ─────────────────────────────────────────────
+  function askPin(msg) {
+    const v = prompt(`${msg ? `${msg}\n` : ''}앱 PIN을 입력해 주세요 (처음 한 번만)`, '');
+    if (v) { store.set('pin', v.trim()); boot(); }
+  }
+
+  async function refreshQuota() {
+    try {
+      quota = await api('/api/quota');
+      $('status').textContent = `무료 조회 ${quota.left}회 남음${quota.renewal ? ` · ${md(quota.renewal)} 초기화` : ''}`;
+    } catch (err) {
+      $('status').textContent = err.needPin ? 'PIN 입력이 필요합니다 (오른쪽 위 ⚙️)' : `서버 연결 실패: ${err.message}`;
+    }
+    updateEstimate();
+  }
+
+  async function boot() {
+    const saved = JSON.parse(store.get('trip') || 'null');
+    const t = saved || { out: addDays(todayKst(), 21), outFlex: 1, back: addDays(todayKst(), 28), backFlex: 1, includeKE: true };
+    $('outDate').value = t.out; $('outFlex').value = t.outFlex; $('backDate').value = t.back; $('backFlex').value = t.backFlex; $('incKE').checked = t.includeKE;
+    $('outDate').min = $('backDate').min = addDays(todayKst(), 1);
+    updateEstimate();
+    await refreshQuota();
+    try {
+      const s = await api('/api/state');
+      if (s?.result) {
+        state = { trip: s.trip, result: s.result, lastRecheck: s.lastRecheck || null };
+        render();
+      }
+    } catch { /* 처음이면 없음 */ }
+  }
+
+  async function recheckNow() {
+    const n = new Set((state.result?.airlines || []).filter((a) => a.best).map((a) => `${a.code === 'KE'}|${a.best.out}|${a.best.back}`)).size;
+    if (!n || !confirm(`저장된 일정 가격을 지금 다시 확인합니다 (조회 약 ${n}회). 결과는 휴대폰 알림으로도 옵니다.`)) return;
+    try {
+      const r = await api('/api/recheck', {});
+      const s = await api('/api/state');
+      state = { trip: s.trip, result: s.result, lastRecheck: s.lastRecheck || null };
+      render();
+      alert(r.skipped || (r.changes?.length ? r.changes.join('\n') : '가격 변동 없음'));
+    } catch (err) { alert(err.message); }
+    refreshQuota();
+  }
+
+  // ── 이벤트 ───────────────────────────────────────────
+  ['outDate', 'outFlex', 'backDate', 'backFlex', 'incKE'].forEach((id) => $(id).addEventListener('change', updateEstimate));
+  $('searchBtn').addEventListener('click', runSearch);
+  $('settings').addEventListener('click', () => askPin());
+  $('recheck').addEventListener('click', recheckNow);
+
   document.addEventListener('click', (ev) => {
-    const t = ev.target.closest('[data-route][data-date]');
-    if (t) return openSheet(t.dataset.route, t.dataset.date);
-    const rt = ev.target.closest('[data-route]');
-    if (rt) { routeId = rt.dataset.route; store.set('route', routeId); return renderAll(); }
-    const st = ev.target.closest('[data-stay]');
-    if (st) { stayId = st.dataset.stay; store.set('stay', stayId); renderTabs(); return renderCombos(); }
+    const t = ev.target.closest('[data-pick],[data-alt],[data-book],[data-vendor],[data-jump],[data-gtab]');
+    if (!t || busy) return;
+    if (t.dataset.pick) {
+      const [code, out, back] = t.dataset.pick.split('|');
+      const a = state.result.airlines.find((x) => x.code === code);
+      const cell = a.matrix[`${out}|${back}`];
+      const opt = cell.opts.find((o) => o.price === cell.price) || cell.opts[0];
+      if (confirm(`${a.name} ${mdw(out)}~${mdw(back)} 일정으로 오는 편까지 확인할까요? (조회 1회)`)) pick(code, out, back, opt);
+    } else if (t.dataset.alt) {
+      const [code, i] = t.dataset.alt.split('|');
+      const a = state.result.airlines.find((x) => x.code === code);
+      const cell = a.matrix[`${a.sel.out}|${a.sel.back}`];
+      const alts = cell.opts.filter((o) => flightsKey(o) !== flightsKey(a.sel.outOpt));
+      if (confirm('이 가는 편으로 오는 편까지 확인할까요? (조회 1회)')) pick(code, a.sel.out, a.sel.back, alts[Number(i)]);
+    } else if (t.dataset.book) {
+      loadVendors(t.dataset.book);
+    } else if (t.dataset.vendor) {
+      const [code, i] = t.dataset.vendor.split('|');
+      const v = $(`vendors-${code}`)._vendors?.[Number(i)];
+      if (v) openVendor(v);
+    } else if (t.dataset.jump) {
+      $(`air-${t.dataset.jump}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else if (t.dataset.gtab) {
+      groundTab = t.dataset.gtab;
+      $('airCards').innerHTML = state.result.airlines.map(airlineCard).join('');
+    }
   });
-  $('reload').addEventListener('click', load);
-  $('sheetClose').addEventListener('click', () => $('sheet').close());
-  $('sheet').addEventListener('click', (ev) => { if (ev.target === $('sheet')) $('sheet').close(); });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && data) load(); });
 
+  // ── 홈 화면 설치 도우미 ───────────────────────────────
+  const ua = navigator.userAgent;
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  const inApp = /KAKAOTALK|NAVER\(inapp|Instagram|FBAN|FBAV|Line\/|DaumApps|everytimeApp/i.test(ua);
+  const samsung = /SamsungBrowser/i.test(ua);
+  const android = /Android/i.test(ua);
+  const ios = /iPhone|iPad/i.test(ua);
   let installEvent = null;
-  window.addEventListener('beforeinstallprompt', (ev) => {
-    ev.preventDefault();
-    installEvent = ev;
-    $('installBtn').hidden = false;
-  });
-  $('installBtn').addEventListener('click', async () => {
-    if (!installEvent) return;
-    installEvent.prompt();
-    await installEvent.userChoice.catch(() => null);
-    installEvent = null;
-    $('installBtn').hidden = true;
-  });
-  if (window.matchMedia('(display-mode: standalone)').matches || navigator.standalone) $('installBox').hidden = true;
 
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  function renderInstall(extra = '') {
+    const box = $('install');
+    if (standalone) { box.hidden = true; return; }
+    let html = '';
+    if (inApp && android) {
+      const url = location.href.replace(/^https?:\/\//, '');
+      html = `<b>카카오톡·네이버 같은 앱 안에서는 홈 화면에 추가할 수 없습니다.</b><br>
+        <a class="btn primary" href="intent://${url}#Intent;scheme=https;package=com.android.chrome;end">크롬으로 열기</a>`;
+    } else if (inApp && ios) {
+      html = '<b>앱 안의 브라우저에서는 추가할 수 없습니다.</b> 오른쪽 아래 <b>…</b> → <b>Safari로 열기</b> 후 공유 버튼 → 홈 화면에 추가';
+    } else if (installEvent) {
+      html = '<button class="btn primary" id="installBtn">📲 홈 화면에 앱 설치</button>';
+    } else if (samsung) {
+      html = '삼성 인터넷: 아래쪽 <b>≡ 메뉴</b> → <b>현재 페이지 추가</b> → <b>홈 화면</b>';
+    } else if (android) {
+      html = '크롬 오른쪽 위 <b>⋮</b> → <b>홈 화면에 추가</b> → <b>설치</b>(또는 <b>바로가기 만들기</b>)';
+    } else if (ios) {
+      html = '사파리 아래쪽 <b>공유(□↑)</b> → <b>홈 화면에 추가</b>';
+    } else {
+      box.hidden = true;
+      return;
+    }
+    if (android && !inApp) {
+      html += `<details class="small"><summary>아이콘이 안 보이면</summary>
+        ① 홈 화면에서 위로 쓸어올려 <b>앱스 화면</b>에 "페낭 항공권"이 있는지 확인 → 길게 눌러 <b>홈에 추가</b><br>
+        ② 삼성: 홈 화면 빈 곳 길게 누르기 → 설정 → <b>"새 앱을 홈 화면에 추가"</b> 켜기<br>
+        ③ 설정 → 애플리케이션 → Chrome → <b>"홈 화면에 바로가기 추가" 권한</b> 허용 후 다시 시도</details>`;
+    }
+    box.innerHTML = html + extra;
+    box.hidden = false;
+    $('installBtn')?.addEventListener('click', async () => {
+      installEvent.prompt();
+      const r = await installEvent.userChoice.catch(() => null);
+      installEvent = null;
+      renderInstall(r?.outcome === 'accepted' ? '<p class="good">설치를 시작했습니다. 잠시 뒤 홈 화면(또는 앱스 화면)을 확인하세요.</p>' : '');
+    });
+  }
+  window.addEventListener('beforeinstallprompt', (ev) => { ev.preventDefault(); installEvent = ev; renderInstall(); });
+  window.addEventListener('appinstalled', () => renderInstall('<p class="good">설치됐습니다! 홈 화면에 없으면 앱스 화면에서 "페낭 항공권"을 길게 눌러 홈에 추가하세요.</p>'));
+  renderInstall();
+
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 
-  load();
+  boot();
 })();

@@ -1,10 +1,14 @@
-// 앱을 설치형(홈 화면)으로 쓰기 위한 서비스 워커.
-// 화면 파일은 저장해 두고, 가격 데이터는 항상 인터넷에서 최신 것을 먼저 받아옵니다 (안 되면 마지막 저장본).
-const CACHE = 'penang-v1';
-const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
+// 홈 화면 설치용 서비스 워커. 화면 파일은 인터넷에서 먼저 받고, 안 되면 저장본을 씁니다.
+const CACHE = 'penang-v2';
+const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'ground.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // 파일 하나가 실패해도 설치 자체는 끝나도록 하나씩 저장합니다.
+  e.waitUntil(
+    caches.open(CACHE)
+      .then((c) => Promise.allSettled(SHELL.map((u) => c.add(u))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener('activate', (e) => {
@@ -18,18 +22,15 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
-
-  // 가격 데이터와 화면 파일 모두 "인터넷 먼저, 안 되면 저장본" — 고친 내용이 바로 반영됩니다.
   e.respondWith(
     fetch(e.request)
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();
-          const key = url.pathname.endsWith('/data/prices.json') ? new Request(url.origin + url.pathname) : e.request;
-          caches.open(CACHE).then((c) => c.put(key, copy));
+          caches.open(CACHE).then((c) => c.put(e.request, copy));
         }
         return res;
       })
-      .catch(() => caches.match(url.pathname.endsWith('/data/prices.json') ? new Request(url.origin + url.pathname) : e.request, { ignoreSearch: true }))
+      .catch(() => caches.match(e.request, { ignoreSearch: true }).then((r) => r || caches.match('index.html')))
   );
 });

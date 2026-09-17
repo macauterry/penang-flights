@@ -1,7 +1,8 @@
 {
+  "id": "/penang-flights/",
   "name": "인천⇄페낭 최저가",
   "short_name": "페낭 항공권",
-  "description": "싱가포르항공·말레이시아항공·대한항공, 경유 1시간 40분~3시간 조건의 인천⇄페낭 날짜별 최저가",
+  "description": "인천⇄페낭 왕복 항공권 비교 (말레이시아항공·싱가포르항공·대한항공) 및 예약 연결",
   "lang": "ko",
   "start_url": "./",
   "scope": "./",
@@ -10,8 +11,29 @@
   "background_color": "#f4f6f5",
   "theme_color": "#0f7f73",
   "icons": [
-    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
   ]
 }

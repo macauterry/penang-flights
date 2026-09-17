@@ -1,0 +1,18 @@
+name = "penang-flights"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+preview_urls = false
+account_id = "e1004fd8e65c15c6c3d426e415426b5f"
+
+# 매일 아침 7시(한국 시각) = 22:00 UTC 에 저장한 일정 가격 재확인
+[triggers]
+crons = ["0 22 * * *"]
+
+[vars]
+APP_URL = "https://macauterry.github.io/penang-flights/"
+ALLOWED_ORIGINS = "https://macauterry.github.io"
+
+[[kv_namespaces]]
+binding = "STORE"
+id = "874037a8bb67467ca260ad2e446f260a"
