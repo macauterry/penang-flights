@@ -1,5 +1,5 @@
 // 홈 화면 설치용 서비스 워커. 화면 파일은 인터넷에서 먼저 받고, 안 되면 저장본을 씁니다.
-const CACHE = 'penang-v2';
+const CACHE = 'penang-v3';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'ground.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
