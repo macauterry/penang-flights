@@ -12,6 +12,28 @@
     KE: { ko: '대한항공', en: 'Korean Air', dest: 'KUL', site: 'https://www.koreanair.com/', hub: '' },
   };
   const AIRPORTS = { ICN: '인천', PEN: '페낭', KUL: '쿠알라룸푸르', SIN: '싱가포르' };
+
+  // 사용자가 자주 쓰는 구매처.
+  //  match = 구글이 알려준 판매처 이름을 이 규칙과 맞춰 봅니다 (이름이 영어로 와도 한글로 바꿔 보여주려고)
+  //  link  = 그 사이트에서 "이 일정"을 직접 확인할 때 열 주소
+  //  exact = 날짜·구간까지 주소에 담을 수 있으면 true (항공사 공식 홈페이지는 봇 차단 때문에 불가능)
+  const MY_SITES = [
+    {
+      key: 'trip', name: '트립닷컴', exact: true, match: /trip\.?com|ctrip|씨트립|트립닷컴/i,
+      link: (t) => (t
+        ? `https://kr.trip.com/flights/showfarefirst?dcity=${t.from.toLowerCase()}&acity=${t.to.toLowerCase()}&ddate=${t.out}&rdate=${t.back}&triptype=rt&class=y&quantity=1&locale=ko-KR&curr=KRW`
+        : 'https://kr.trip.com/flights/'),
+    },
+    {
+      key: 'agoda', name: '아고다', exact: true, match: /agoda|아고다/i,
+      link: (t) => (t
+        ? `https://www.agoda.com/ko-kr/flights/results?departureFrom=${t.from}&arrivalTo=${t.to}&departDate=${t.out}&returnDate=${t.back}&searchType=2&cabinType=Economy&adults=1`
+        : 'https://www.agoda.com/ko-kr/flights'),
+    },
+    { key: 'KE', name: '대한항공 공식', airline: 'KE', match: /korean ?air|대한항공/i, link: () => 'https://www.koreanair.com/booking/search?tripType=RT' },
+    { key: 'SQ', name: '싱가포르항공 공식', airline: 'SQ', match: /singapore ?air|싱가포르항공/i, link: () => 'https://www.singaporeair.com/ko_KR/kr/book-a-trip/' },
+    { key: 'MH', name: '말레이시아항공 공식', airline: 'MH', match: /malaysia ?air|말레이시아항공/i, link: () => 'https://www.malaysiaairlines.com/kr/ko/home.html' },
+  ];
   const DOW = ['일', '월', '화', '수', '목', '금', '토'];
   const PRE_TRIP = 150; // 집 → 인천공항 30분 + 출발 2시간 전 도착
   const POST_PEN = 60; // 페낭공항 도착 → 집 (짐 찾기 + 택시)
@@ -40,6 +62,7 @@
   let quota = null;
   let busy = false;
   let groundTab = 'out';
+  const vendorCache = new Map(); // 항공사코드 → 판매처 원본 (예약 화면으로 넘기는 값, 새로고침하면 사라짐)
 
   // ── 표시 도우미 ───────────────────────────────────────
   const parseD = (iso) => new Date(`${iso}T00:00:00Z`);
@@ -560,34 +583,64 @@
     $('results').hidden = !has;
     if (!has) return;
     renderCompare();
+    renderSites();
     $('airCards').innerHTML = state.result.airlines.map(airlineCard).join('');
     renderWatch();
     renderLog();
   }
 
   // ── 예약 ─────────────────────────────────────────────
-  async function loadVendors(code) {
+  // 이 항공편을 "실제로 파는 곳"과 그곳의 최종 결제 금액을 가져옵니다 (조회 1회).
+  // 트립닷컴·하나투어 같은 판매 사이트와 항공사 공식 홈페이지가 같이 나옵니다.
+  async function fetchVendors(code) {
     const a = state.result.airlines.find((x) => x.code === code);
+    if (!a?.sel || a.sel.noReturn) return [];
+    let data = null;
+    if (a.sel.bookingToken) {
+      data = await serp({ ...baseParams(code, a.sel.out, a.sel.back), booking_token: a.sel.bookingToken }).catch(() => null);
+    }
+    if (!data?.booking_options?.length) {
+      // 오래돼서 만료됐으면 오는 편부터 다시 확정
+      const cell = a.matrix[`${a.sel.out}|${a.sel.back}`];
+      const fresh = listOf(await serp(baseParams(code, a.sel.out, a.sel.back))).find((o) => flightsKey(o) === flightsKey(a.sel.outOpt)) || cell?.opts?.[0];
+      a.sel = await detail(code, a.sel.out, a.sel.back, fresh);
+      data = await serp({ ...baseParams(code, a.sel.out, a.sel.back), booking_token: a.sel.bookingToken });
+    }
+    return (data.booking_options || [])
+      .map((o) => o.together || o.departing)
+      .filter((v) => v?.booking_request?.url)
+      .sort((x, y) => (x.price || 1e12) - (y.price || 1e12));
+  }
+
+  // 가져온 판매처를 ③ 표에서도 쓰도록 보관합니다.
+  // 예약 화면으로 넘기는 값은 덩치가 커서 화면(메모리)에만 두고, 서버에는 보여줄 내용만 저장합니다.
+  function keepVendors(code, vendors) {
+    vendorCache.set(code, vendors);
+    const a = state.result.airlines.find((x) => x.code === code);
+    if (!a?.sel || a.sel.noReturn) return;
+    a.sites = {
+      at: new Date().toISOString(),
+      out: a.sel.out,
+      back: a.sel.back,
+      flights: `${flySummary(a.sel.outOpt).nos} / ${flySummary(a.sel.retOpt).nos}`,
+      rows: vendors.map((v, i) => ({
+        i,
+        name: String(v.book_with || '이름 없음'),
+        price: Number(v.price) > 0 ? Number(v.price) : null,
+        bag: (v.baggage_prices || []).join(' · '),
+      })),
+    };
+  }
+
+  async function loadVendors(code) {
     const box = $(`vendors-${code}`);
-    if (!a?.sel) return;
+    if (!state.result.airlines.find((x) => x.code === code)?.sel) return;
     box.innerHTML = '<p class="loading">예약처와 최종 가격을 불러오는 중… (15초쯤 걸립니다 · 조회 1회)</p>';
     try {
-      let data = null;
-      if (a.sel.bookingToken) {
-        data = await serp({ ...baseParams(code, a.sel.out, a.sel.back), booking_token: a.sel.bookingToken }).catch(() => null);
-      }
-      if (!data?.booking_options?.length) {
-        // 오래돼서 만료됐으면 오는 편부터 다시 확정
-        const cell = a.matrix[`${a.sel.out}|${a.sel.back}`];
-        const fresh = listOf(await serp(baseParams(code, a.sel.out, a.sel.back))).find((o) => flightsKey(o) === flightsKey(a.sel.outOpt)) || cell?.opts?.[0];
-        a.sel = await detail(code, a.sel.out, a.sel.back, fresh);
-        data = await serp({ ...baseParams(code, a.sel.out, a.sel.back), booking_token: a.sel.bookingToken });
-      }
-      const vendors = (data.booking_options || [])
-        .map((o) => o.together || o.departing)
-        .filter((v) => v?.booking_request?.url)
-        .sort((x, y) => (x.price || 1e12) - (y.price || 1e12));
+      const vendors = await fetchVendors(code);
       if (!vendors.length) throw new Error('예약처 정보가 없습니다');
+      keepVendors(code, vendors);
+      renderSites();
       const airlineVendor = (v) => /항공|airlines|air$|korean air|대한/i.test(v.book_with || '');
       box.innerHTML = `<p class="note">누르면 해당 사이트의 <b>이 일정 예약 화면</b>으로 바로 이동합니다. 가격 낮은 순.</p>
         ${vendors.map((v, i) => `<button class="vendor${airlineVendor(v) ? ' direct' : ''}" data-vendor="${code}|${i}">
@@ -600,6 +653,104 @@
       if (err.needPin) return askPin(err.message);
       box.innerHTML = `<p class="bad">예약처를 불러오지 못했습니다: ${esc(err.message)}. 위의 구글 플라이트 버튼으로 이동해 주세요.</p>`;
     }
+  }
+
+  // ── ③ 사이트별 구매 가능 가격 ─────────────────────────
+  const siteMeta = (name) => MY_SITES.find((x) => x.match.test(String(name || ''))) || null;
+  const tripOf = (a) => (a && a.sel && !a.sel.noReturn ? { from: 'ICN', to: AIRLINES[a.code].dest, out: a.sel.out, back: a.sel.back } : null);
+
+  // 항공사마다 한 번씩(조회 N회) 파는 곳을 모읍니다.
+  async function scanSites() {
+    if (busy) return;
+    const ready = state.result.airlines.filter((a) => a.sel && !a.sel.noReturn);
+    if (!ready.length) return;
+    busy = true;
+    $('sites').innerHTML = `<p class="loading">${ready.length}개 항공사의 판매 사이트와 최종 가격을 모으는 중… (한 곳당 15초쯤 · 조회 ${ready.length}회)</p>`;
+    const errs = [];
+    try {
+      for (const a of ready) {
+        try {
+          const vendors = await fetchVendors(a.code);
+          if (!vendors.length) throw new Error('파는 곳 정보가 없습니다');
+          keepVendors(a.code, vendors);
+        } catch (err) {
+          if (err.needPin) throw err;
+          errs.push(`${a.name}: ${err.message}`);
+        }
+      }
+      state.result.siteErrors = errs;
+      renderSites();
+      saveState();
+    } catch (err) {
+      if (err.needPin) askPin(err.message);
+      else $('sites').innerHTML = `<p class="bad">값을 모으지 못했습니다: ${esc(err.message)}</p>`;
+    } finally {
+      busy = false;
+      refreshQuota();
+    }
+  }
+
+  // 자주 쓰는 사이트 5곳을 "이 일정"으로 바로 열 수 있는 줄
+  function directLinks() {
+    const r = state.result;
+    const pick = (code) => r.airlines.find((a) => a.code === code && a.sel && !a.sel.noReturn);
+    const anyPen = pick('MH') || pick('SQ');
+    const items = MY_SITES.map((site) => {
+      const t = tripOf(site.airline ? pick(site.airline) : anyPen);
+      const hits = [];
+      for (const a of r.airlines) for (const row of a.sites?.rows || []) if (row.price && site.match.test(row.name)) hits.push(row.price);
+      const best = hits.length ? Math.min(...hits) : null;
+      const note = best
+        ? `<span class="good small">아래 표에 있음 · 최저 ${won(best)}</span>`
+        : '<span class="muted small">구글에 값이 안 올라옴 → 직접 확인</span>';
+      const how = site.exact && t ? `${md(t.out)}~${md(t.back)} 자동 입력` : '날짜 직접 입력';
+      return `<li><a href="${site.link(t)}" target="_blank" rel="noopener"><b>${esc(site.name)}</b></a> ${note} <span class="muted small">${how}</span></li>`;
+    }).join('');
+    return `<div class="direct"><h4>🔗 자주 쓰는 사이트에서 직접 확인</h4><ul>${items}</ul>
+      <p class="note">트립닷컴·아고다는 <b>이 일정이 미리 입력된 검색 화면</b>으로 열립니다.
+      항공사 공식 홈페이지 3곳은 프로그램 접속을 막아 둬서(대한항공은 접속 자체를 차단) 예약 화면만 열리고 날짜는 직접 넣어야 합니다.</p></div>`;
+  }
+
+  function renderSites() {
+    const r = state.result;
+    const box = $('sites');
+    if (!box) return;
+    const ready = r.airlines.filter((a) => a.sel && !a.sel.noReturn);
+    if (!ready.length) {
+      box.innerHTML = '<p class="empty">먼저 위 ② 에서 가는 날·오는 날을 확정해 주세요. 확정한 항공편을 파는 사이트와 값을 모아 옵니다.</p>';
+      return;
+    }
+    const scanned = ready.filter((a) => a.sites?.rows?.length);
+    if (!scanned.length) {
+      box.innerHTML = `<p class="note">확정한 항공편을 <b>실제로 파는 사이트</b>와 그곳의 최종 금액을 모읍니다.
+        트립닷컴·하나투어 같은 판매처와 항공사 공식 홈페이지가 같이 나오고, 줄을 누르면 그 사이트의 <b>이 일정 예약 화면</b>으로 바로 넘어갑니다.</p>
+        <button class="btn primary wide" id="scanBtn">💳 사이트별 실제 판매가 모으기 (조회 ${ready.length}회)</button>${directLinks()}`;
+      return;
+    }
+    const rows = [];
+    for (const a of scanned) for (const row of a.sites.rows) rows.push({ ...row, code: a.code, air: a.name, box: a.sites });
+    rows.sort((x, y) => (x.price ?? 1e12) - (y.price ?? 1e12));
+    const low = rows.find((x) => x.price)?.price ?? null;
+    const list = rows.map((x) => {
+      const m = siteMeta(x.name);
+      const live = Boolean(vendorCache.get(x.code)?.[x.i]?.booking_request);
+      const alias = m && m.name !== x.name ? ` <span class="muted small">${esc(x.name)}</span>` : '';
+      return `<button class="site${m ? ' mine' : ''}${x.price && x.price === low ? ' low' : ''}" data-sitebuy="${x.code}|${x.i}">
+        <span class="s1"><b>${esc(m ? m.name : x.name)}</b>${alias}${m ? ' <span class="tag mine">자주 쓰는 곳</span>' : ''}${x.price && x.price === low ? ' <span class="tag">최저</span>' : ''}</span>
+        <span class="s2 muted">${esc(x.air)} · ${md(x.box.out)}~${md(x.box.back)} · ${esc(x.box.flights)}${x.bag ? ` · ${esc(x.bag)}` : ''}${live ? '' : ' · 예약 연결 만료(사이트만 열림)'}</span>
+        <span class="price">${won(x.price)}</span>
+      </button>`;
+    }).join('');
+    const at = scanned.map((a) => Date.parse(a.sites.at)).sort((q, w) => w - q)[0];
+    const rest = ready.filter((a) => !a.sites?.rows?.length);
+    const again = rest.length
+      ? `<button class="btn wide" id="scanBtn">💳 나머지(${rest.map((a) => a.name).join('·')})도 모으기 (조회 ${rest.length}회)</button>`
+      : `<button class="btn wide" id="scanBtn">🔄 값 다시 확인 (조회 ${ready.length}회)</button>`;
+    box.innerHTML = `<div class="sitelist">${list}</div>
+      <p class="note">모두 <b>왕복 1인 · 그 사이트에서 실제로 살 수 있는 금액</b>이고 싼 순서입니다. 확인 ${stamp(new Date(at).toISOString())} 기준 —
+      항공권 값은 수시로 바뀌니 누른 뒤 예약 화면의 금액을 한 번 더 확인하세요.
+      ${r.siteErrors?.length ? `<br><span class="bad">못 가져온 곳: ${esc(r.siteErrors.join(' / '))}</span>` : ''}</p>
+      ${again}${directLinks()}`;
   }
 
   function openVendor(v) {
@@ -702,7 +853,8 @@
       renderLog();
       return;
     }
-    const t = ev.target.closest('[data-pick],[data-alt],[data-book],[data-vendor],[data-jump],[data-gtab]');
+    if (ev.target.closest('#scanBtn')) { scanSites(); return; }
+    const t = ev.target.closest('[data-pick],[data-alt],[data-book],[data-vendor],[data-sitebuy],[data-jump],[data-gtab]');
     if (!t || busy) return;
     if (t.dataset.pick) {
       const [code, out, back] = t.dataset.pick.split('|');
@@ -722,6 +874,19 @@
       const [code, i] = t.dataset.vendor.split('|');
       const v = $(`vendors-${code}`)._vendors?.[Number(i)];
       if (v) openVendor(v);
+    } else if (t.dataset.sitebuy) {
+      // 줄을 누르면 그 사이트의 이 일정 예약 화면으로. 연결이 만료됐으면 그 사이트 검색 화면으로.
+      const [code, i] = t.dataset.sitebuy.split('|');
+      const v = vendorCache.get(code)?.[Number(i)];
+      if (v?.booking_request) { openVendor(v); return; }
+      const a = state.result.airlines.find((x) => x.code === code);
+      const name = a?.sites?.rows?.[Number(i)]?.name || '';
+      const site = siteMeta(name);
+      const info = AIRLINES[code];
+      window.open(
+        site ? site.link(tripOf(a)) : googleQ(`Flights from ICN to ${info.dest} on ${a.sel.out} through ${a.sel.back} on ${info.en}`),
+        '_blank', 'noopener'
+      );
     } else if (t.dataset.jump) {
       $(`air-${t.dataset.jump}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } else if (t.dataset.gtab) {
